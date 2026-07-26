@@ -127,6 +127,10 @@ impl Args {
             config.p2p.clear_net.outbound_connections = outbound_connections;
         }
 
+        if self.prune {
+            config.storage.blockchain.prune = true;
+        }
+
         config
             .p2p
             .clear_net
