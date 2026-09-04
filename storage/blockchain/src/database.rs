@@ -1,7 +1,9 @@
 use std::{
     borrow::Cow,
     collections::HashMap,
+    path::Path,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use arc_swap::ArcSwap;
@@ -21,6 +23,14 @@ use crate::{
 
 /// The key used to store the main-chain tip in [`BlockchainDatabase::chain_tip`].
 pub(crate) const CHAIN_TIP_KEY: &[u8] = b"tip";
+
+/// The amount of times [`BlockchainDatabase::read_transactions`] will retry before giving up.
+///
+/// With [`TIPS_MATCH_RETRY_DELAY`] this waits 60 seconds, the bound only has to outlast a write, a pair that still disagrees after it is not waiting on one.
+const TIPS_MATCH_RETRIES: usize = 6_000;
+
+/// The amount of time [`BlockchainDatabase::read_transactions`] sleeps between retries.
+const TIPS_MATCH_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 /// Deletes a [`fjall::Keyspace`] and recreates it with the same name.
 fn recreate_fjall_keyspace(
@@ -42,6 +52,73 @@ pub(crate) fn reset_fjall_keyspace(
     keyspace.store(Arc::new(new_keyspace));
 
     Ok(())
+}
+
+/// The [`KeyspaceCreateOptions`] for [`BlockchainDatabase::prunable_tip`].
+///
+/// It is created in 2 places, [`BlockchainDatabase::open_with_fjall_database`] and [`BlockchainDatabase::enable_pruning`], and both must use the same options.
+fn prunable_tip_options() -> KeyspaceCreateOptions {
+    KeyspaceCreateOptions::default().with_kv_separation(Some(
+        KvSeparationOptions::default()
+            .separation_threshold(3_000)
+            .compression(fjall::CompressionType::None),
+    ))
+}
+
+/// The [`TapeOpenOptions`] for a tape in `dir`, keeping `top_cache_size` bytes of its top in memory.
+fn tape_options(top_cache_size: u64, dir: &Path) -> TapeOpenOptions {
+    TapeOpenOptions {
+        top_cache_size,
+        dir: dir.to_path_buf(),
+    }
+}
+
+/// Reads the [`PruningSeed`] committed to the `tapes_metadata` tape.
+///
+/// [`BlockchainDatabase::enable_pruning`] is the only writer of that tape, so an empty one means this node was never pruned.
+///
+/// # Panics
+///
+/// This will panic if the committed seed is not a valid [`PruningSeed`], only a corrupt tape can hold one.
+fn read_pruning_seed(
+    tapes: &impl TapesRead,
+    tapes_metadata: &tapes::BlobTape,
+) -> Result<PruningSeed, BlockchainError> {
+    if tapes.blob_tape_len(tapes_metadata).unwrap_or(0) == 0 {
+        return Ok(PruningSeed::NotPruned);
+    }
+
+    let mut seed_bytes = [0; 4];
+    tapes.read_bytes(tapes_metadata, 0, &mut seed_bytes)?;
+
+    Ok(PruningSeed::decompress(u32::from_le_bytes(seed_bytes)).unwrap())
+}
+
+/// Opens the [`BlockchainDatabase::prunable_blobs`] tapes `pruning_seed` tells us to keep, leaving the rest as [`None`].
+///
+/// Open every tape while the seed is not committed, [`BlockchainDatabase::enable_pruning`] fills `prunable_tip` from all of them.
+/// Once it is committed only the stripe we keep is opened, the other 7 are deleted by the caller.
+fn open_prunable_tapes(
+    tape_append_tx: &mut tapes::TapesAppendTransaction,
+    pruning_seed: PruningSeed,
+    options: &TapeOpenOptions,
+) -> Result<Vec<Option<tapes::BlobTape>>, BlockchainError> {
+    let prunable_blobs = (0..8)
+        .map(|i| {
+            if pruning_seed
+                .get_stripe()
+                .is_none_or(|stripe| u32_to_usize(stripe) - 1 == i)
+            {
+                tape_append_tx
+                    .open_blob_tape(PRUNABLE_BLOBS[i], options)
+                    .map(Some)
+            } else {
+                Ok(None)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(prunable_blobs)
 }
 
 /// The blockchain database.
@@ -207,123 +284,82 @@ const PRUNABLE_BLOBS: [&str; 8] = [
 
 impl BlockchainDatabase {
     /// Open a [`BlockchainDatabase`] with an [`fjall::Database`] for storing data that can't be stored in tapes.
+    ///
+    /// This only opens what is already on disk, the [`PruningSeed`] committed to the tapes decides which `prunable_blobs` tapes come with it.
+    /// It does not check that the 2 halves agree, nor does it act on [`Config::prune`], [`BlockchainDatabase::make_consistent`] does both.
     pub fn open_with_fjall_database(
         config: &Config,
         fjall: fjall::Database,
     ) -> Result<Self, BlockchainError> {
-        let block_heights = fjall.keyspace("block_heights", KeyspaceCreateOptions::default)?;
-        let chain_tip = fjall.keyspace("chain_tip", KeyspaceCreateOptions::default)?;
-        let key_images = fjall.keyspace("key_images", KeyspaceCreateOptions::default)?;
-        let pre_rct_outputs = fjall.keyspace("pre_rct_outputs", KeyspaceCreateOptions::default)?;
-        let tx_ids = fjall.keyspace("tx_ids", KeyspaceCreateOptions::default)?;
-        let v1_tx_outputs = fjall.keyspace("tx_outputs", KeyspaceCreateOptions::default)?;
+        // Everything in here is derived from the tapes, so it can always be rebuilt
+        let (block_heights, chain_tip, key_images, pre_rct_outputs, tx_ids, v1_tx_outputs) =
+            Self::open_main_chain_keyspaces(&fjall)?;
 
-        let alt_chain_infos = fjall.keyspace("alt_chain_infos", KeyspaceCreateOptions::default)?;
-        let alt_block_heights =
-            fjall.keyspace("alt_block_heights", KeyspaceCreateOptions::default)?;
-        let alt_block_infos = fjall.keyspace("alt_block_infos", KeyspaceCreateOptions::default)?;
-        let alt_block_blobs = fjall.keyspace("alt_block_blobs", KeyspaceCreateOptions::default)?;
-        let alt_transaction_blobs =
-            fjall.keyspace("alt_transaction_blobs", KeyspaceCreateOptions::default)?;
-        let alt_transaction_infos =
-            fjall.keyspace("alt_transaction_infos", KeyspaceCreateOptions::default)?;
+        // Alt blocks never reach the tapes, so this is the only copy of them
+        let (
+            alt_chain_infos,
+            alt_block_heights,
+            alt_block_infos,
+            alt_block_blobs,
+            alt_transaction_blobs,
+            alt_transaction_infos,
+        ) = Self::open_alt_chain_keyspaces(&fjall)?;
 
         // If we already have a `prunable_tip` keyspace then open it here, otherwise we will make a
         // new one and fill it in later if pruning.
         let prunable_tip = fjall
             .keyspace_exists("prunable_tip")
-            .then(|| {
-                fjall.keyspace("prunable_tip", || {
-                    KeyspaceCreateOptions::default().with_kv_separation(Some(
-                        KvSeparationOptions::default()
-                            .separation_threshold(3_000)
-                            .compression(fjall::CompressionType::None),
-                    ))
-                })
-            })
+            .then(|| fjall.keyspace("prunable_tip", prunable_tip_options))
             .transpose()?;
 
+        // The tapes => the authoritative copy of the chain.
         let tapes_index_dir = config.index_dir.join("tapes");
         let tapes_blob_dir = config.blob_dir.join("tapes");
 
         let mut linear_tapes = Tapes::open(&tapes_index_dir)?;
         let mut tape_append_tx = linear_tapes.append();
 
+        // Open every tape, each keeping the amount of its top the config asks for in memory.
+        // The `prunable_blobs` ones come last because which of them we open depends on the seed committed to `tapes_metadata`
         let rct_outputs = tape_append_tx.open_fixed_sized_tape(
             "rct_outputs",
-            &TapeOpenOptions {
-                top_cache_size: config.cache_sizes.rct_outputs,
-                dir: tapes_index_dir.clone(),
-            },
+            &tape_options(config.cache_sizes.rct_outputs, &tapes_index_dir),
         )?;
         let tx_infos = tape_append_tx.open_fixed_sized_tape(
             "tx_infos",
-            &TapeOpenOptions {
-                top_cache_size: config.cache_sizes.tx_infos,
-                dir: tapes_index_dir.clone(),
-            },
+            &tape_options(config.cache_sizes.tx_infos, &tapes_index_dir),
         )?;
         let block_infos = tape_append_tx.open_fixed_sized_tape(
             "block_infos",
-            &TapeOpenOptions {
-                top_cache_size: config.cache_sizes.block_infos,
-                dir: tapes_index_dir.clone(),
-            },
+            &tape_options(config.cache_sizes.block_infos, &tapes_index_dir),
         )?;
-        let tapes_metadata = tape_append_tx.open_blob_tape(
-            "tapes_metadata",
-            &TapeOpenOptions {
-                top_cache_size: 8,
-                dir: tapes_index_dir,
-            },
-        )?;
+        let tapes_metadata =
+            tape_append_tx.open_blob_tape("tapes_metadata", &tape_options(8, &tapes_index_dir))?;
         let pruned_blobs = tape_append_tx.open_blob_tape(
             "pruned_blobs",
-            &TapeOpenOptions {
-                top_cache_size: config.cache_sizes.pruned_blobs,
-                dir: tapes_blob_dir.clone(),
-            },
+            &tape_options(config.cache_sizes.pruned_blobs, &tapes_blob_dir),
         )?;
         let v1_prunable_blobs = tape_append_tx.open_blob_tape(
             "v1_prunable_blobs",
-            &TapeOpenOptions {
-                top_cache_size: config.cache_sizes.v1_prunable_blobs,
-                dir: tapes_blob_dir.clone(),
-            },
+            &tape_options(config.cache_sizes.v1_prunable_blobs, &tapes_blob_dir),
         )?;
 
-        let prunable_tape_open_options = TapeOpenOptions {
-            top_cache_size: config.cache_sizes.prunable_blobs,
-            dir: tapes_blob_dir,
-        };
+        let prunable_tape_open_options =
+            tape_options(config.cache_sizes.prunable_blobs, &tapes_blob_dir);
 
-        let pruning_seed = if tape_append_tx.blob_tape_len(&tapes_metadata).unwrap_or(0) == 0 {
-            PruningSeed::NotPruned
-        } else {
-            let mut seed_bytes = [0; 4];
-            tape_append_tx.read_bytes(&tapes_metadata, 0, &mut seed_bytes)?;
+        let pruning_seed = read_pruning_seed(&tape_append_tx, &tapes_metadata)?;
+        let prunable_blobs = open_prunable_tapes(
+            &mut tape_append_tx,
+            pruning_seed,
+            &prunable_tape_open_options,
+        )?;
 
-            PruningSeed::decompress(u32::from_le_bytes(seed_bytes)).unwrap()
-        };
-
-        let prunable_blobs = (0..8)
-            .map(|i| {
-                if pruning_seed
-                    .get_stripe()
-                    .is_none_or(|stripe| u32_to_usize(stripe) - 1 == i)
-                    || prunable_tip.is_none()
-                {
-                    tape_append_tx
-                        .open_blob_tape(PRUNABLE_BLOBS[i], &prunable_tape_open_options)
-                        .map(Some)
-                } else {
-                    Ok(None)
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
+        // Commit before deleting anything.
+        // `delete_tape` refuses to run while an append transaction is alive.
         tape_append_tx.commit(Persistence::SyncAll)?;
 
+        // Delete every tape `open_prunable_tapes` left closed.
+        // `enable_pruning` already deletes them, this is a no-op unless it was interrupted before it got there
         for (i, prunable_blob) in prunable_blobs.iter().enumerate() {
             if prunable_blob.is_none() {
                 linear_tapes.delete_tape(PRUNABLE_BLOBS[i], &prunable_tape_open_options)?;
@@ -360,6 +396,76 @@ impl BlockchainDatabase {
         })
     }
 
+    /// Opens the [`fjall::Keyspace`]s holding main-chain data.
+    ///
+    /// Every one of these is derived from the tapes.
+    /// [`BlockchainDatabase::rebuild_fjall_database`] recreates them by replaying the tapes, so losing any of them is recoverable.
+    fn open_main_chain_keyspaces(
+        fjall: &fjall::Database,
+    ) -> Result<
+        (
+            fjall::Keyspace,
+            fjall::Keyspace,
+            fjall::Keyspace,
+            fjall::Keyspace,
+            fjall::Keyspace,
+            fjall::Keyspace,
+        ),
+        BlockchainError,
+    > {
+        let block_heights = fjall.keyspace("block_heights", KeyspaceCreateOptions::default)?;
+        let chain_tip = fjall.keyspace("chain_tip", KeyspaceCreateOptions::default)?;
+        let key_images = fjall.keyspace("key_images", KeyspaceCreateOptions::default)?;
+        let pre_rct_outputs = fjall.keyspace("pre_rct_outputs", KeyspaceCreateOptions::default)?;
+        let tx_ids = fjall.keyspace("tx_ids", KeyspaceCreateOptions::default)?;
+        let v1_tx_outputs = fjall.keyspace("tx_outputs", KeyspaceCreateOptions::default)?;
+
+        Ok((
+            block_heights,
+            chain_tip,
+            key_images,
+            pre_rct_outputs,
+            tx_ids,
+            v1_tx_outputs,
+        ))
+    }
+
+    /// Opens the [`fjall::Keyspace`]s holding alt-chain data.
+    ///
+    /// These hold the only copy of their data, alt blocks never reach the tapes, so [`BlockchainDatabase::rebuild_fjall_database`] drops them instead of replaying them.
+    fn open_alt_chain_keyspaces(
+        fjall: &fjall::Database,
+    ) -> Result<
+        (
+            fjall::Keyspace,
+            fjall::Keyspace,
+            fjall::Keyspace,
+            fjall::Keyspace,
+            fjall::Keyspace,
+            fjall::Keyspace,
+        ),
+        BlockchainError,
+    > {
+        let alt_chain_infos = fjall.keyspace("alt_chain_infos", KeyspaceCreateOptions::default)?;
+        let alt_block_heights =
+            fjall.keyspace("alt_block_heights", KeyspaceCreateOptions::default)?;
+        let alt_block_infos = fjall.keyspace("alt_block_infos", KeyspaceCreateOptions::default)?;
+        let alt_block_blobs = fjall.keyspace("alt_block_blobs", KeyspaceCreateOptions::default)?;
+        let alt_transaction_blobs =
+            fjall.keyspace("alt_transaction_blobs", KeyspaceCreateOptions::default)?;
+        let alt_transaction_infos =
+            fjall.keyspace("alt_transaction_infos", KeyspaceCreateOptions::default)?;
+
+        Ok((
+            alt_chain_infos,
+            alt_block_heights,
+            alt_block_infos,
+            alt_block_blobs,
+            alt_transaction_blobs,
+            alt_transaction_infos,
+        ))
+    }
+
     /// Returns whether Fjall and Tapes are at the same main-chain tip.
     fn tips_match(
         &self,
@@ -388,10 +494,17 @@ impl BlockchainDatabase {
     }
 
     /// Returns Fjall and Tapes read transactions at the same main-chain tip.
+    ///
+    /// A write commits the tapes before fjall, so a reader that lands between the 2 commits gets a mismatched pair.
+    /// Retrying gives the writer the time it needs to finish.
+    ///
+    /// # Panics
+    ///
+    /// This will panic if the tips still disagree after `TIPS_MATCH_RETRIES` retries.
     pub fn read_transactions(
         &self,
     ) -> Result<(fjall::Snapshot, TapesReadTransaction), BlockchainError> {
-        loop {
+        for _ in 0..TIPS_MATCH_RETRIES {
             let fjall = self.fjall.snapshot();
             let tapes = self.linear_tapes.reader();
 
@@ -399,8 +512,12 @@ impl BlockchainDatabase {
                 return Ok((fjall, tapes));
             }
 
-            // TODO: bound this and panic if we can't get the txs to agree.
+            std::thread::sleep(TIPS_MATCH_RETRY_DELAY);
         }
+
+        // Fjall and the tapes disagree *and* nothing is closing the gap, so give up
+        // Restarting rebuilds fjall from the tapes, spinning here forever would just hang every reader instead
+        panic!("fjall and the tapes did not agree on a main-chain tip after {TIPS_MATCH_RETRIES} retries, a write failed part way through, restart to rebuild fjall from the tapes");
     }
 
     /// Checks if the fjall and tapes database are in sync and rebuilds the fjall database if it
@@ -418,10 +535,16 @@ impl BlockchainDatabase {
             self.rebuild_fjall_database()?;
         }
 
-        // If we are pruning and don't have the `prunable_tip` table then enable pruning.
-        if (self.config.prune || self.pruning_seed != PruningSeed::NotPruned)
-            && self.prunable_tip.is_none()
-        {
+        // We are pruned *but* `prunable_tip` is gone, so fail loudly
+        if self.pruning_seed != PruningSeed::NotPruned && self.prunable_tip.is_none() {
+            return Err(BlockchainError::MissingPrunableTip);
+        }
+
+        // Pruning was requested *and* no seed is committed yet, so activate it.
+        //
+        // This doesn't test `prunable_tip` because a crash mid-activation could leave a half-filled one behind, and skipping on that would leave the node unpruned.
+        // Resuming over a half-filled `prunable_tip` would be safe because no seed means no tape was deleted yet, so we rewrite its entries from the same tapes
+        if self.config.prune && self.pruning_seed == PruningSeed::NotPruned {
             self.enable_pruning()?;
         }
 
@@ -445,10 +568,18 @@ impl BlockchainDatabase {
         reset_fjall_keyspace(&self.fjall, &self.alt_transaction_blobs)?;
         reset_fjall_keyspace(&self.fjall, &self.alt_transaction_infos)?;
 
-        if let Some(prunable_tip) = self.prunable_tip.take() {
-            self.fjall.delete_keyspace(prunable_tip)?;
-        }
+        // It is taken out of `self` for the duration of the replay rather than deleted,
+        // because leaving it in place would overwrite every V2 entry with the empty prunable blob the rebuild feeds it.
+        // It has to go back even if the replay fails, otherwise `self` would be left believing a pruned node has no tip data at all.
+        let prunable_tip = self.prunable_tip.take();
+        let res = self.replay_tapes_into_fjall();
+        self.prunable_tip = prunable_tip;
 
+        res
+    }
+
+    /// Replays the tapes into the fjall keyspaces [`BlockchainDatabase::rebuild_fjall_database`] just recreated.
+    fn replay_tapes_into_fjall(&self) -> Result<(), BlockchainError> {
         let rebuild_span = tracing::info_span!("rebuild_fjall_database");
         let _guard = rebuild_span.enter();
 
@@ -467,6 +598,7 @@ impl BlockchainDatabase {
 
             let tx = Transaction::read(&mut tx_blob.as_slice()).unwrap();
 
+            // The prunable blob only ever reaches `prunable_tip`, which is out of `self` for the replay, so an empty one is enough
             (Cow::Owned(tx), Cow::Owned(vec![]))
         });
 
@@ -479,6 +611,7 @@ impl BlockchainDatabase {
             let block =
                 crate::ops::block::get_block(&u64_to_usize(height), None, &tapes_reader, self)?;
 
+            // `add_block_to_dynamic_tables` takes the miner tx from the block, drop the tape's copy so `tx_iter` lines up with `block.transactions`
             let _miner_tx = tx_iter.next();
 
             crate::ops::block::add_block_to_dynamic_tables(
@@ -513,39 +646,72 @@ impl BlockchainDatabase {
         self.pruning_seed
     }
 
-    /// - generate new [`PruningSeed`] (if one doesn't exist)
-    /// - populate [`BlockchainDatabase::prunable_tip`] with latest blocks
-    /// - delete unnecessary [`BlockchainDatabase::prunable_blobs`]
+    /// Enables pruning by filling [`BlockchainDatabase::prunable_tip`] from all tapes, then delete the 7 we no longer need.
+    ///
+    /// **The order matters!, steps 4 and 5 are destructive**:
+    ///
+    /// 1. Get the [`PruningSeed`] to prune with
+    ///     - In memory only, nothing is written yet
+    /// 2. Populate `prunable_tip` with the latest blocks
+    /// 3. Persist it to disk
+    ///     - Committing a `fjall` batch is not enough, it can still be lost on a crash
+    /// 4. Commit the [`PruningSeed`]
+    ///     - The point of no return, from here on the node counts as pruned
+    ///     - The next startup deletes the tapes even if we crash before step 5
+    /// 5. Delete the unnecessary [`BlockchainDatabase::prunable_blobs`]
+    ///
+    /// If interrupted before 4, the node is still unpruned with every tape intact and the next startup redoes this, reusing the partial `prunable_tip` (as long as pruning is still requested)
+    ///
+    /// # Panics
+    ///
+    /// This will panic if the node already has a committed [`PruningSeed`], that is what guarantees every prunable tape is open.
     fn enable_pruning(&mut self) -> Result<(), BlockchainError> {
-        if self.pruning_seed == PruningSeed::NotPruned {
-            let mut tapes_tx = self.linear_tapes.append();
+        debug_assert_eq!(self.pruning_seed, PruningSeed::NotPruned);
 
-            // generate a random stripe index to prune
-            let stripe_idx = rand::thread_rng().gen_range(
-                1..=u32::try_from(PRUNABLE_BLOBS.len())
-                    .expect("there shouldn't be that many prunable blobs"),
-            );
-            let seed = PruningSeed::new_pruned(stripe_idx, CRYPTONOTE_PRUNING_LOG_STRIPES).unwrap();
-            self.pruning_seed = seed;
-            tapes_tx.append_bytes(&self.tapes_metadata, &seed.compress().to_le_bytes())?;
-            tapes_tx.commit(Persistence::SyncAll)?;
-        }
-
-        tracing::info!(
-            "Pruning chain on stripe = {:?}.",
-            self.pruning_seed.get_stripe().unwrap()
+        // 1. Get the seed to prune with (in memory only)
+        // Only a node that is not pruned yet gets here, so the stripe is always a fresh random one
+        let stripe_idx = rand::thread_rng().gen_range(
+            1..=u32::try_from(PRUNABLE_BLOBS.len())
+                .expect("there shouldn't be that many prunable blobs"),
         );
+        let seed = PruningSeed::new_pruned(stripe_idx, CRYPTONOTE_PRUNING_LOG_STRIPES).unwrap();
+
+        let stripe = seed.get_stripe().unwrap();
+
+        tracing::info!("Pruning chain on stripe = {stripe:?}.");
+
+        // 2. Populate `prunable_tip`
+        let prunable_tip = self.fill_prunable_tip()?;
+
+        // 3. Persist `prunable_tip` to disk
+        // Make the tip durable before recording that we are pruned and before deleting the tapes it replaces
+        self.fjall.persist(PersistMode::SyncAll)?;
+
+        // 4. Commit the seed (the point of no return)
+        let mut tapes_tx = self.linear_tapes.append();
+        tapes_tx.append_bytes(&self.tapes_metadata, &seed.compress().to_le_bytes())?;
+        tapes_tx.commit(Persistence::SyncAll)?;
+
+        self.pruning_seed = seed;
+        self.prunable_tip = Some(prunable_tip);
+
+        // 5. Delete the tapes we no longer need
+        self.delete_unnecessary_tapes(stripe)
+    }
+
+    /// Fills a `prunable_tip` keyspace with the prunable blobs of the last [`CRYPTONOTE_PRUNING_TIP_BLOCKS`] blocks.
+    ///
+    /// This is step 2 of [`BlockchainDatabase::enable_pruning`], it writes nothing else and deletes nothing.
+    ///
+    /// # Panics
+    ///
+    /// This will panic if the node already has a committed [`PruningSeed`], that is what guarantees every prunable tape is open.
+    fn fill_prunable_tip(&self) -> Result<fjall::Keyspace, BlockchainError> {
+        // An interrupted run leaves a correct but incomplete keyspace, so reuse it if it is there
+        let prunable_tip = self.fjall.keyspace("prunable_tip", prunable_tip_options)?;
 
         let tapes_reader = self.linear_tapes.reader();
         let mut w = self.fjall.batch();
-
-        let prunable_tip = self.fjall.keyspace("prunable_tip", || {
-            KeyspaceCreateOptions::default().with_kv_separation(Some(
-                KvSeparationOptions::default()
-                    .separation_threshold(3_000)
-                    .compression(fjall::CompressionType::None),
-            ))
-        })?;
 
         let start_tip_height = tapes_reader
             .fixed_sized_tape_len(&self.block_infos)
@@ -566,24 +732,18 @@ impl BlockchainDatabase {
             if tx_info.is_v1_tx() {
                 continue;
             }
-            let stripe = cuprate_pruning::get_block_pruning_stripe(
+            let tx_stripe = cuprate_pruning::get_block_pruning_stripe(
                 tx_info.height,
                 usize::MAX,
                 CRYPTONOTE_PRUNING_LOG_STRIPES,
             )
             .unwrap();
 
-            let Some(prunable_blob) = self.prunable_blobs
-                [usize::try_from(stripe).expect("stripe will not exceed usize::MAX") - 1]
+            // Pruning is only enabled while the seed is not committed
+            let prunable_blob = self.prunable_blobs
+                [usize::try_from(tx_stripe).expect("stripe will not exceed usize::MAX") - 1]
                 .as_ref()
-            else {
-                self.prunable_tip = Some(prunable_tip);
-                w.commit()?;
-
-                tracing::warn!("We are missing some prunable tip data, top cache will be short.");
-
-                return Ok(());
-            };
+                .expect("every prunable tape is open when enabling pruning");
 
             let mut blob = vec![0; tx_info.prunable_size];
             tapes_reader.read_bytes(prunable_blob, tx_info.prunable_blob_idx, &mut blob)?;
@@ -595,18 +755,21 @@ impl BlockchainDatabase {
                 w = self.fjall.batch();
             }
         }
-        self.prunable_tip = Some(prunable_tip);
         w.commit()?;
 
-        // TODO: make the tapes delete API better so we don't need to reconstruct this.
-        let tapes_blob_dir = self.config.blob_dir.join("tapes");
-        let prunable_tape_open_options = TapeOpenOptions {
-            top_cache_size: self.config.cache_sizes.prunable_blobs,
-            dir: tapes_blob_dir,
-        };
+        Ok(prunable_tip)
+    }
 
-        drop(tapes_reader);
-        let stripe = self.pruning_seed.get_stripe().unwrap();
+    /// Deletes every [`BlockchainDatabase::prunable_blobs`] tape outside `stripe`.
+    ///
+    /// This is step 5 of [`BlockchainDatabase::enable_pruning`], it must not run before `prunable_tip` is on disk and the [`PruningSeed`] is committed.
+    /// TODO: make the tapes delete API better so we don't need to reconstruct this.
+    fn delete_unnecessary_tapes(&mut self, stripe: u32) -> Result<(), BlockchainError> {
+        let prunable_tape_open_options = tape_options(
+            self.config.cache_sizes.prunable_blobs,
+            &self.config.blob_dir.join("tapes"),
+        );
+
         for (i, prunable_blob) in self.prunable_blobs.iter_mut().enumerate() {
             if u32_to_usize(stripe) - 1 != i {
                 self.linear_tapes

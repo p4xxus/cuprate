@@ -9,4 +9,6 @@ pub enum BlockchainError {
     Fjall(#[from] fjall::Error),
     #[error("not found")]
     NotFound,
+    #[error("pruned database is missing the prunable tip, the data it held cannot be recovered")]
+    MissingPrunableTip,
 }
